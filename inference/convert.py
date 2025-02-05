@@ -1,11 +1,13 @@
 import os
 import shutil
 from argparse import ArgumentParser
-from tqdm import tqdm, trange
+from tqdm import tqdm
 import torch
 from safetensors.torch import safe_open, save_file
-from transformers import AutoModel
+from transformers import AutoModel, AutoConfig
+from huggingface_hub import hf_hub_download
 
+# Define your existing mapping or other configurations here
 mapping = {
     "embed_tokens": ("embed", 0),
     "input_layernorm": ("attn_norm", None),
@@ -27,90 +29,115 @@ mapping = {
     "scale": ("scale", None),
 }
 
-def download_and_convert(hf_ckpt_path, save_path, n_experts, mp):
+def remove_file_from_cache(file_name):
     """
-    Downloads model parameters and converts them on the fly.
-
-    Args:
-        hf_ckpt_path (str): Hugging Face model checkpoint name or path.
-        save_path (str): Path to the directory where the converted checkpoint files will be saved.
-        n_experts (int): Total number of experts in the model.
-        mp (int): Model parallelism factor.
-
-    Returns:
-        None
+    Remove the downloaded file from the Hugging Face cache directory.
     """
-    torch.set_num_threads(8)
-    n_local_experts = n_experts // mp
-    state_dicts = [{} for _ in range(mp)]
+    hf_cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    file_path = os.path.join(hf_cache_dir, "models--deepseek-ai--DeepSeek-V3", "blobs", file_name)
+    
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        print(f"Removed {file_path} from cache.")
+    else:
+        print(f"File {file_path} not found in cache.")
 
-    # Load model directly from Hugging Face Hub
-    model = AutoModel.from_pretrained(hf_ckpt_path)
+def download_and_process_one_shard(hf_ckpt_path, save_path, shard_idx, mp, timeout=300):
+    """
+    Download, process, and delete each shard one at a time with a custom timeout.
+    """
+    # Construct the filename for the current shard
+    shard_name = f"model-{shard_idx:05d}-of-000163.safetensors"
+    
+    # Construct file path to load
+    file_path = os.path.join(hf_ckpt_path, shard_name)
+    
+    print(f"Processing {shard_name}...")
 
-    # Iterate over the model's state_dict to process only the parameters that start with "model"
-    for name, param in tqdm(model.state_dict().items()):
-        if name.startswith("model."):
-            original_name = name
-            name = name[len("model."):]  # Remove the 'model.' prefix
+    # Set the custom timeout for downloading
+    try:
+        # You can set the timeout for huggingface_hub here
+        downloaded_file_path = hf_hub_download(
+            repo_id=hf_ckpt_path, 
+            filename=shard_name,
+            use_auth_token=True,
+            local_dir=hf_ckpt_path,  # Specify the directory to store
+            timeout=timeout  # Timeout in seconds (default is 60)
+        )
 
-            # Apply custom name replacements as specified
-            name = name.replace("self_attn", "attn")
-            name = name.replace("mlp", "ffn")
-            name = name.replace("weight_scale_inv", "scale")
-            name = name.replace("e_score_correction_bias", "bias")
+        # Continue with your processing
+        config = AutoConfig.from_pretrained(hf_ckpt_path)
+        if "quantization_config" in config:
+            del config.quantization_config  # Remove quantization config if present
 
-            key = name.split(".")[-2]
-            assert key in mapping
-            new_key, dim = mapping[key]
-            name = name.replace(key, new_key)
+        model = AutoModel.from_pretrained(hf_ckpt_path, config=config, torch_dtype=torch.float32)
 
-            # Distribute model parameters across MP (model parallelism)
-            for i in range(mp):
-                new_param = param
-                if "experts" in name and "shared_experts" not in name:
-                    idx = int(name.split(".")[-3])
-                    if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
-                        continue
-                elif dim is not None:
-                    assert param.size(dim) % mp == 0
-                    shard_size = param.size(dim) // mp
-                    new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
+        # Process the model's parameters and convert them
+        state_dicts = [{} for _ in range(mp)]
+        for name, param in tqdm(model.state_dict().items()):
+            if name.startswith("model."):
+                original_name = name
+                name = name[len("model."):]  # Remove the 'model.' prefix
 
-                # Store the new parameters
-                state_dicts[i][name] = new_param
+                # Apply custom name replacements as specified
+                name = name.replace("self_attn", "attn")
+                name = name.replace("mlp", "ffn")
+                name = name.replace("weight_scale_inv", "scale")
+                name = name.replace("e_score_correction_bias", "bias")
 
-    os.makedirs(save_path, exist_ok=True)
+                key = name.split(".")[-2]
+                assert key in mapping
+                new_key, dim = mapping[key]
+                name = name.replace(key, new_key)
 
-    # Save the converted model parts
-    for i in trange(mp):
-        save_file(state_dicts[i], os.path.join(save_path, f"model{i}-mp{mp}.safetensors"))
+                # Distribute model parameters across MP (model parallelism)
+                for i in range(mp):
+                    new_param = param
+                    if "experts" in name and "shared_experts" not in name:
+                        idx = int(name.split(".")[-3])
+                        if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
+                            continue
+                    elif dim is not None:
+                        assert param.size(dim) % mp == 0
+                        shard_size = param.size(dim) // mp
+                        new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
 
-    # After conversion, delete the parameters to free up memory
-    del model
+                    # Store the new parameters
+                    state_dicts[i][name] = new_param
+
+        # Save the converted model part
+        os.makedirs(save_path, exist_ok=True)
+        for i in range(mp):
+            save_file(state_dicts[i], os.path.join(save_path, f"model_shard_{shard_idx}_mp{i}.safetensors"))
+
+        # After processing, delete the current shard from the cache
+        remove_file_from_cache(shard_name)
+
+        # Clear the model from memory
+        del model
+
+    except Exception as e:
+        print(f"Error downloading {shard_name}: {str(e)}")
 
 def main(hf_ckpt_path, save_path, n_experts, mp):
     """
-    Main function to initiate the download and conversion process.
-    
-    Args:
-        hf_ckpt_path (str): The Hugging Face model checkpoint path.
-        save_path (str): Directory where the converted checkpoint files will be saved.
-        n_experts (int): Number of experts in the model.
-        mp (int): Model parallelism factor.
-
-    Returns:
-        None
+    Process and delete model shards one by one to save disk space.
     """
-    download_and_convert(hf_ckpt_path, save_path, n_experts, mp)
+    torch.set_num_threads(8)
+    n_local_experts = n_experts // mp
+
+    # Process each shard one by one
+    for shard_idx in range(1, 164):  # Assuming there are 163 shards
+        download_and_process_one_shard(hf_ckpt_path, save_path, shard_idx, mp, timeout=600)  # Set timeout to 600 seconds
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--hf-ckpt-path", type=str, required=True, help="Hugging Face checkpoint path")
-    parser.add_argument("--save-path", type=str, required=True, help="Directory to save converted files")
-    parser.add_argument("--n-experts", type=int, required=True, help="Total number of experts in the model")
-    parser.add_argument("--model-parallel", type=int, required=True, help="Model parallelism factor")
+    parser.add_argument("--hf-ckpt-path", type=str, required=True)
+    parser.add_argument("--save-path", type=str, required=True)
+    parser.add_argument("--n-experts", type=int, required=True)
+    parser.add_argument("--model-parallel", type=int, required=True)
     args = parser.parse_args()
-    
-    assert args.n_experts % args.model_parallel == 0, "Number of experts must be divisible by model parallelism"
+
+    assert args.n_experts % args.model_parallel == 0
 
     main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel)
