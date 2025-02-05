@@ -1,13 +1,13 @@
 import os
-import shutil
 from argparse import ArgumentParser
 from glob import glob
 from tqdm import tqdm, trange
 
 import torch
 from safetensors.torch import safe_open, save_file
+from huggingface_hub import hf_hub_download, list_repo_files
 
-
+# Mapping dictionary for renaming keys
 mapping = {
     "embed_tokens": ("embed", 0),
     "input_layernorm": ("attn_norm", None),
@@ -30,6 +30,29 @@ mapping = {
 }
 
 
+def download_model_files(repo_id, save_path):
+    """
+    Downloads model files (starting with 'model') from Hugging Face Hub.
+
+    Args:
+        repo_id (str): Hugging Face repository ID (e.g., 'deepseek-ai/DeepSeek-V3').
+        save_path (str): Local directory to save the downloaded files.
+
+    Returns:
+        list: List of file paths to the downloaded files.
+    """
+    os.makedirs(save_path, exist_ok=True)
+    files = list_repo_files(repo_id)
+    model_files = [f for f in files if f.startswith("model")]
+
+    downloaded_files = []
+    for file_name in tqdm(model_files, desc="Downloading model files"):
+        file_path = hf_hub_download(repo_id, file_name, cache_dir=save_path)
+        downloaded_files.append(file_path)
+
+    return downloaded_files
+
+
 def main(hf_ckpt_path, save_path, n_experts, mp):
     """
     Converts and saves model checkpoint files into a specified format.
@@ -39,7 +62,7 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
         save_path (str): Path to the directory where the converted checkpoint files will be saved.
         n_experts (int): Total number of experts in the model.
         mp (int): Model parallelism factor.
-        
+
     Returns:
         None
     """
@@ -47,7 +70,10 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
     n_local_experts = n_experts // mp
     state_dicts = [{} for _ in range(mp)]
 
-    for file_path in tqdm(glob(os.path.join(hf_ckpt_path, "*.safetensors"))):
+    # Download model files from Hugging Face Hub
+    model_files = download_model_files(hf_ckpt_path, save_path)
+
+    for file_path in tqdm(model_files, desc="Processing model files"):
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
                 if "model.layers.61" in name:
@@ -77,20 +103,16 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
 
     os.makedirs(save_path, exist_ok=True)
 
-    for i in trange(mp):
+    for i in trange(mp, desc="Saving converted files"):
         save_file(state_dicts[i], os.path.join(save_path, f"model{i}-mp{mp}.safetensors"))
-
-    for file_path in glob(os.path.join(hf_ckpt_path, "*token*")):
-        new_file_path = os.path.join(save_path, os.path.basename(file_path))
-        shutil.copyfile(file_path, new_file_path)
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--hf-ckpt-path", type=str, required=True)
-    parser.add_argument("--save-path", type=str, required=True)
-    parser.add_argument("--n-experts", type=int, required=True)
-    parser.add_argument("--model-parallel", type=int, required=True)
+    parser.add_argument("--hf-ckpt-path", type=str, required=True, help="Hugging Face repository ID (e.g., 'deepseek-ai/DeepSeek-V3').")
+    parser.add_argument("--save-path", type=str, required=True, help="Path to save the converted model files.")
+    parser.add_argument("--n-experts", type=int, required=True, help="Total number of experts in the model.")
+    parser.add_argument("--model-parallel", type=int, required=True, help="Model parallelism factor.")
     args = parser.parse_args()
     assert args.n_experts % args.model_parallel == 0
     main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel)
