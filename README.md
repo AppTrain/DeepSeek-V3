@@ -302,18 +302,32 @@ Convert Hugging Face model weights to a specific format:
 python convert.py --hf-ckpt-path /path/to/DeepSeek-V3 --save-path /path/to/DeepSeek-V3-Demo --n-experts 256 --model-parallel 16
 ```
 
+# DeepSeek-V3 Docker Setup
+
+### Step 1: Build the Docker Image
+
+1. **Build the Docker Image**:  
+   Open a terminal in the project root, and run the following command to build your Docker image:
+
+   ```bash
+   docker build -t deepseek-v3 .
+
+
 #### Run
 
 Then you can chat with DeepSeek-V3:
 
 ```shell
-torchrun --nnodes 2 --nproc-per-node 8 --node-rank $RANK --master-addr $ADDR generate.py --ckpt-path /path/to/DeepSeek-V3-Demo --config configs/config_671B.json --interactive --temperature 0.7 --max-new-tokens 200
+docker run --rm -it --network none  -e RANK=0 -e --gpus all --name deepseek-v3-container deepseek-v3
+
 ```
 
 Or batch inference on a given file:
 
 ```shell
-torchrun --nnodes 2 --nproc-per-node 8 --node-rank $RANK --master-addr $ADDR generate.py --ckpt-path /path/to/DeepSeek-V3-Demo --config configs/config_671B.json --input-file $FILE
+docker run --rm --network none -it -e RANK=0 --gpus all --name deepseek-v3-container deepseek-v3 \
+torchrun --nnodes 2 --nproc-per-node 8 --node-rank $RANK --master-addr localhost generate.py --ckpt-path /path/to/DeepSeek-V3-Demo --config configs/config_671B.json --input-file /path/to/input/$FILE
+
 ```
 
 ### 6.2 Inference with SGLang (recommended)
